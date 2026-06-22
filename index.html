@@ -428,6 +428,53 @@ async function sbPost(table,data){
   }
 }
 
+// ── REPAIR ORPHANED REVIEWS ──────────────────────────────────────────
+// Finds case reviews whose record_id does not match any existing death
+// record (caused by offline records getting a new id when synced to cloud),
+// and re-links them to the correct record where it can be determined safely.
+async function repairOrphanedReviews(){
+  const records=await sbGetDirect('dghdap_records','hospital_key=eq.'+HOSPITAL.key+'&limit=2000');
+  const reviews=await sbGetDirect('dghdap_reviews','hospital_key=eq.'+HOSPITAL.key+'&limit=2000');
+  if(!records||!reviews||!records.length||!reviews.length)return 0;
+
+  const recordIds=new Set(records.map(function(r){return r.id;}));
+  const orphanedReviews=reviews.filter(function(rv){return !recordIds.has(rv.record_id);});
+  if(!orphanedReviews.length)return 0;
+
+  // Records that currently have NO valid review pointing at them
+  const reviewedIds=new Set(reviews.filter(function(rv){return recordIds.has(rv.record_id);}).map(function(rv){return rv.record_id;}));
+  const unreviewedRecords=records.filter(function(r){return !reviewedIds.has(r.id);});
+
+  let fixedCount=0;
+
+  // Safe automatic case: exactly one orphan and exactly one unreviewed record
+  if(orphanedReviews.length===1&&unreviewedRecords.length===1){
+    await sbPatchDirect('dghdap_reviews',orphanedReviews[0].id,{record_id:unreviewedRecords[0].id});
+    fixedCount=1;
+  }
+  // Multiple orphans: match by closest review_date to date_of_death as best-effort,
+  // only auto-fixing pairs that are unambiguous (one candidate within 30 days)
+  else if(orphanedReviews.length>1&&unreviewedRecords.length>0){
+    const usedRecordIds=new Set();
+    for(const rv of orphanedReviews){
+      const rvDate=rv.review_date?new Date(rv.review_date).getTime():null;
+      const candidates=unreviewedRecords.filter(function(r){
+        if(usedRecordIds.has(r.id))return false;
+        if(!rvDate||!r.date_of_death)return true;
+        const diffDays=Math.abs((rvDate-new Date(r.date_of_death).getTime())/864e5);
+        return diffDays<=30;
+      });
+      if(candidates.length===1){
+        await sbPatchDirect('dghdap_reviews',rv.id,{record_id:candidates[0].id});
+        usedRecordIds.add(candidates[0].id);
+        fixedCount++;
+      }
+    }
+  }
+
+  return fixedCount;
+}
+
 // ── HYBRID PATCH ──────────────────────────────────────────────────────
 async function sbPatch(table,id,data){
   // Update locally
@@ -497,13 +544,36 @@ async function syncOfflineQueue(){
     const op=q[i];
     try{
       if(op.op==='post'){
+        // CRITICAL FIX: if this is a death record, before posting, check if any
+        // queued review ops reference this record's local_id and remap them
+        // to use a placeholder we'll resolve right after we get the server id
         const result=await sbPostDirect(op.table,op.data);
         // Update local record to mark as synced
         if(result&&result[0]){
+          const serverRecord=result[0];
           const db=localDB();
           const key=op.table==='dghdap_records'?'records':op.table==='dghdap_reviews'?'reviews':'meetings';
           const idx=db[key].findIndex(function(r){return r.id===op.local_id||r.id===op.data.id;});
-          if(idx>=0)db[key][idx]={...result[0],_local:false,_synced:true};
+          if(idx>=0)db[key][idx]={...serverRecord,_local:false,_synced:true};
+
+          // CRITICAL FIX: if a death record just got its real server id,
+          // repoint any case reviews (saved locally OR still queued) that
+          // reference the OLD temporary local id
+          if(op.table==='dghdap_records'&&op.local_id&&op.local_id!==serverRecord.id){
+            // Fix reviews already saved in local db
+            db.reviews.forEach(function(rv){
+              if(rv.record_id===op.local_id){
+                rv.record_id=serverRecord.id;
+                // if this review hasn't synced yet, fix the queued op too
+                if(rv._local&&!rv._synced){
+                  const revOp=q.find(function(o){return o.op==='post'&&o.table==='dghdap_reviews'&&o.local_id===rv.id;});
+                  if(revOp&&revOp.data)revOp.data.record_id=serverRecord.id;
+                }else if(rv._synced&&rv.id){
+                  q.push({op:'patch',table:'dghdap_reviews',id:rv.id,data:{record_id:serverRecord.id},queued_at:new Date().toISOString()});
+                }
+              }
+            });
+          }
           saveLocalDB(db);
         }
         synced++;
@@ -1097,7 +1167,16 @@ function recordsView(){
     syncBtn.disabled=false;syncBtn.textContent='☁️ Sync Now';
     loadRecords();
   });
-  recBtnRow.appendChild(expBtn);recBtnRow.appendChild(syncBtn);
+  const repairBtn=btn('btn btn-sm btn-s','🔧 Repair Reviews',async function(){
+    repairBtn.disabled=true;repairBtn.textContent='Repairing...';
+    try{
+      const fixed=await repairOrphanedReviews();
+      notify(fixed>0?('✓ Fixed '+fixed+' review link'+(fixed>1?'s':'')):'No issues found — all reviews correctly linked','ok',3500);
+      loadRecords();
+    }catch(e){notify('Repair error: '+e.message,'err');}
+    repairBtn.disabled=false;repairBtn.textContent='🔧 Repair Reviews';
+  });
+  recBtnRow.appendChild(expBtn);recBtnRow.appendChild(syncBtn);recBtnRow.appendChild(repairBtn);
   wrap.appendChild(recBtnRow);
 
   const list=div('');list.id='rec-list';
